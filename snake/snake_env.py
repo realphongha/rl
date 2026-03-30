@@ -3,6 +3,9 @@ import numpy as np
 from gymnasium import spaces
 from collections import deque
 
+def manhattan(a, b):
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
 class SnakeEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10}
 
@@ -77,19 +80,28 @@ class SnakeEnv(gym.Env):
         # 1. Check Collisions (Walls)
         if (new_head[0] < 0 or new_head[0] >= self.size or
             new_head[1] < 0 or new_head[1] >= self.size):
-            return self._build_obs(), -1.0, True, False, {"length": len(self._snake)}
+            return self._build_obs(), -1.0, True, False, {
+                "length": len(self._snake), "dist_reward": 0.0
+            }
 
         # 2. Check Collisions (Self)
         if new_head in self._snake:
-            return self._build_obs(), -1.0, True, False, {"length": len(self._snake)}
+            return self._build_obs(), -1.0, True, False, {
+                "length": len(self._snake), "dist_reward": 0.0
+            }
 
         # 3. Check Timeout
         if self._steps >= self._max_steps:
-            return self._build_obs(), 0.0, True, False, {"length": len(self._snake)}
+            return self._build_obs(), 0.0, True, False, {
+                "length": len(self._snake), "dist_reward": 0.0
+            }
+
+        old_dist = manhattan(self._snake[0], self._food)
 
         self._snake.appendleft(new_head)
 
         # 4. Reward Logic
+        dist_reward = 0.0
         if new_head == self._food:
             self._place_food()
             reward = 1.0
@@ -99,8 +111,12 @@ class SnakeEnv(gym.Env):
             self._snake.pop()
             # Sparse reward: tiny living penalty to discourage looping
             reward = -0.01
+            new_dist = manhattan(new_head, self._food)
+            dist_reward = 0.01 if (new_dist < old_dist) else -0.01
 
-        return self._build_obs(), reward, False, False, {"length": len(self._snake)}
+        return self._build_obs(), reward, False, False, {
+            "length": len(self._snake), "dist_reward": dist_reward
+        }
 
     def _place_food(self):
         empty = [

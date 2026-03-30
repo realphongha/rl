@@ -13,7 +13,9 @@ import shutil
 # --- CONFIGURATION ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BOARD_SIZE = 8
-LR = 3e-4
+LR_PHASE1 = 3e-4
+LR_PHASE2 = 1e-4
+LR_PHASE3 = 5e-5
 GAMMA, GAE_LAMBDA = 0.99, 0.95
 CLIP_EPS, ENTROPY_COEF = 0.2, 0.02
 ROLLOUT_STEPS = 2048
@@ -22,8 +24,11 @@ UPDATE_EPOCHS = 4
 RENDER = True
 NUM_ENVS = 32
 
-EPS = 10000
-REWARD_SHAPING_MUL = 1.0
+EPS = 5000
+PHASE2 = 3000
+PHASE3 = 3500
+REWARD_SHAPING_MUL = 0.0
+assert EPS > PHASE3 > PHASE2
 
 OUTPUT_DIR = f"outputs/snake"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -32,6 +37,36 @@ shutil.copy("run_snake.py", OUTPUT_DIR)
 shutil.copy("snake_env.py", OUTPUT_DIR)
 
 # --- MODELS ---
+
+def get_convs():
+    # conv 3x3 + stride 1 to keep it pixel-perfect
+    return nn.Sequential(
+        nn.Conv2d(3, 16, kernel_size=3, padding=1), nn.LeakyReLU(),
+        nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.LeakyReLU(),
+        nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.LeakyReLU()
+    )
+
+class SnakeCNN(nn.Module):
+    def __init__(self, size):
+        super().__init__()
+        self.convs = get_convs()
+        self.flatten = nn.Flatten()
+        feat_dim = 64 * size * size
+        self.actor = nn.Linear(feat_dim, 4)
+        self.critic = nn.Linear(feat_dim, 1)
+        self._init()
+
+    def _init(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain('relu'))
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.constant_(self.critic.bias, 0)
+
+    def forward(self, x):
+        f = self.flatten(self.convs(x))
+        return self.actor(f), self.critic(f)
 
 class SnakeTransformer(nn.Module):
     def __init__(self, size=8, d_model=128, nhead=4, num_layers=3):
@@ -94,6 +129,29 @@ class SnakeTransformer(nn.Module):
 
         return self.actor(global_feat), self.critic(global_feat)
 
+class SnakeHybridNet(nn.Module):
+    def __init__(self, size, d_model=128, nhead=4, num_layers=2):
+        super().__init__()
+        self.convs = get_convs()
+        self.proj = nn.Linear(64, d_model)
+        self.pos_emb = nn.Parameter(torch.randn(1, size * size, d_model))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.actor = nn.Linear(d_model, 4)
+        self.critic = nn.Linear(d_model, 1)
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.constant_(self.critic.bias, 0)
+
+    def forward(self, x):
+        f = self.convs(x)
+        b, c, h, w = f.shape
+        tokens = f.view(b, c, h*w).permute(0, 2, 1)
+        tokens = self.proj(tokens) + self.pos_emb
+        out = self.transformer(tokens)
+        global_feat = out.mean(dim=1)
+        return self.actor(global_feat), self.critic(global_feat)
+
 # --- TRAINING ENGINE ---
 
 def make_env():
@@ -104,20 +162,53 @@ def train():
 
     envs = gym.vector.AsyncVectorEnv([make_env() for _ in range(NUM_ENVS)])
     eval_env = gym.make("Snake-v0", size=BOARD_SIZE, render_mode="human" if RENDER else None)
-    model = SnakeTransformer(BOARD_SIZE).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-5)
+    model = SnakeCNN(BOARD_SIZE).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=LR_PHASE1, eps=1e-5)
 
     best_len = 0
     current_phase = 1
 
     for iteration in range(1, EPS+1):
+        # --- PHASE TRANSITION LOGIC ---
+        if iteration == PHASE2+1:
+            shutil.copy(os.path.join(OUTPUT_DIR, "best.pth"), os.path.join(OUTPUT_DIR, "best-cnn.pth"))
+            best_len = 0
+            print("\n💉 PHASE 2: Change to Hybrid CNN+Transformer...")
+            old_state = model.state_dict()
+            model = SnakeHybridNet(BOARD_SIZE).to(DEVICE)
+            new_state = model.state_dict()
+            mapped_weights = {k: v for k, v in old_state.items() if "convs" in k}
+            new_state.update(mapped_weights)
+            model.load_state_dict(new_state)
+
+            print("❄️ Freezing CNN backbone for Transformer warmup...")
+            for p in model.convs.parameters(): p.requires_grad = False
+            optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE2)
+            current_phase = 2
+        elif iteration == PHASE3+1:
+            print("\n🔥 PHASE 3: Unfreezing CNN for final joint fine-tuning!")
+            for p in model.convs.parameters(): p.requires_grad = True
+            optimizer = optim.Adam(model.parameters(), lr=LR_PHASE3)
+            current_phase = 3
+
         # --- SCHEDULING ---
         frac = 1.0 - (iteration - 1.0) / EPS
         # current_ent_coef = ENTROPY_COEF * frac + 0.001 * (1.0 - frac)
         current_ent_coef = ENTROPY_COEF * (frac ** 2) + 0.0005
 
         # Scale LR relative to the phase
-        current_lr = LR * max(frac, 0.0)
+        if current_phase == 1:
+            phase_frac = 1.0 - (iteration - 1.0) / PHASE2
+            current_lr = LR_PHASE1 * max(phase_frac, 0.0)
+        elif current_phase == 2:
+            phase_frac = 1.0 - (iteration - PHASE2 - 1.0) / (PHASE3 - PHASE2)
+            current_lr = LR_PHASE2 * max(phase_frac, 0.0)
+        else:
+            phase_frac = 1.0 - (iteration - PHASE3 - 1.0) / (EPS - PHASE3)
+            current_lr = LR_PHASE3 * max(phase_frac, 0.0)
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
 
         # --- ROLLOUT ---
         states, actions, logprobs, rewards, values, masks, ep_lens = [], [], [], [], [], [], []
@@ -135,8 +226,6 @@ def train():
                 action = dist_m.sample()
 
             next_state, reward, term, trunc, info = envs.step(action.cpu().numpy())
-            # if iteration <= REWARD_SHAPING_EPS:
-            #     reward += info["dist_reward"] * REWARD_SHAPING_MUL
             reward += info["dist_reward"] * REWARD_SHAPING_MUL
             done = term | trunc
             if done.any():
