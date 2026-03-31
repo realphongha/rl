@@ -38,7 +38,7 @@ if use_wandb:
         project="rl",
         name=f"snake_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
         config={
-            "model_type": "transformer",
+            "model_type": "cnn",
             "lr": LR,
             "rollout_steps": ROLLOUT_STEPS,
             "eps": EPS,
@@ -50,6 +50,36 @@ if use_wandb:
     wandb.run.log_code("run_snake.py")
 
 # --- MODELS ---
+
+def get_convs():
+    # conv 3x3 + stride 1 to keep it pixel-perfect
+    return nn.Sequential(
+        nn.Conv2d(3, 16, kernel_size=3, padding=1), nn.LeakyReLU(),
+        nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.LeakyReLU(),
+        nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.LeakyReLU()
+    )
+
+class SnakeCNN(nn.Module):
+    def __init__(self, size):
+        super().__init__()
+        self.convs = get_convs()
+        self.flatten = nn.Flatten()
+        feat_dim = 64 * size * size
+        self.actor = nn.Linear(feat_dim, 4)
+        self.critic = nn.Linear(feat_dim, 1)
+        self._init()
+
+    def _init(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain('relu'))
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.constant_(self.critic.bias, 0)
+
+    def forward(self, x):
+        f = self.flatten(self.convs(x))
+        return self.actor(f), self.critic(f)
 
 class SnakeTransformer(nn.Module):
     def __init__(self, size=8, d_model=128, nhead=4, num_layers=3):
@@ -112,6 +142,53 @@ class SnakeTransformer(nn.Module):
 
         return self.actor(global_feat), self.critic(global_feat)
 
+class SnakeHybridNet(nn.Module):
+    def __init__(self, size, d_model=128, nhead=4, num_layers=2):
+        super().__init__()
+        self.convs = get_convs()
+        self.proj = nn.Linear(64, d_model)
+        self.pos_emb = nn.Parameter(torch.randn(1, size * size, d_model))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.actor = nn.Linear(d_model, 4)
+        self.critic = nn.Linear(d_model, 1)
+        self._init()
+
+    def _init(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # Orthogonal init with LeakyReLU gain
+                gain = nn.init.calculate_gain('leaky_relu')
+                nn.init.orthogonal_(m.weight, gain=gain)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+            elif isinstance(m, nn.Linear):
+                # Standard linear layers in the Transformer/Projection
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        # 1. The "Quiet" Actor: Near-uniform exploration at start
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.constant_(self.actor.bias, 0)
+
+        # 2. The "Standard" Critic: Clear value signal
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.constant_(self.critic.bias, 0)
+
+        # 3. Subtle Positional Embeddings: Don't drown out the features!
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+    def forward(self, x):
+        f = self.convs(x)
+        b, c, h, w = f.shape
+        tokens = f.view(b, c, h*w).permute(0, 2, 1)
+        tokens = self.proj(tokens) + self.pos_emb
+        out = self.transformer(tokens)
+        global_feat = out.mean(dim=1)
+        return self.actor(global_feat), self.critic(global_feat)
+
 # --- TRAINING ENGINE ---
 
 def make_env():
@@ -122,7 +199,7 @@ def train():
 
     envs = gym.vector.AsyncVectorEnv([make_env() for _ in range(NUM_ENVS)])
     eval_env = gym.make("Snake-v0", size=BOARD_SIZE, render_mode="human" if RENDER else None)
-    model = SnakeTransformer(BOARD_SIZE).to(DEVICE)
+    model = SnakeCNN(BOARD_SIZE).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-5)
 
     best_len = 0
@@ -153,9 +230,8 @@ def train():
                 action = dist_m.sample()
 
             next_state, reward, term, trunc, info = envs.step(action.cpu().numpy())
-            # if iteration <= REWARD_SHAPING_EPS:
-            #     reward += info["dist_reward"] * REWARD_SHAPING_MUL
-            reward += info["dist_reward"] * REWARD_SHAPING_MUL
+            if "dist_reward" in info:
+                reward += info["dist_reward"] * REWARD_SHAPING_MUL
             done = term | trunc
             if done.any():
                 ep_lens.extend(info["length"][done].tolist())

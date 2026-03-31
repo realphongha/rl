@@ -105,6 +105,8 @@ class SnakeEnv(gym.Env):
         if new_head == self._food:
             self._place_food()
             reward = 1.0
+            # reward bonus for longer snakes (more complexity)
+            reward += len(self._snake) / self.size / self.size
             # Reset steps on eat to reward activity
             self._steps = 0
         else:
