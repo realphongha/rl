@@ -1,5 +1,8 @@
-# Proejct specific
+# Project specific
 outputs/
+
+# Other libs
+wandb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

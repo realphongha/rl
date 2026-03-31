@@ -8,7 +8,7 @@ import gymnasium as gym
 import snake_env
 import os
 import shutil
-# from datetime import datetime
+from datetime import datetime
 
 # --- CONFIGURATION ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -19,7 +19,7 @@ CLIP_EPS, ENTROPY_COEF = 0.2, 0.02
 ROLLOUT_STEPS = 2048
 BATCH_SIZE = 128
 UPDATE_EPOCHS = 4
-RENDER = True
+RENDER = False
 NUM_ENVS = 32
 
 EPS = 10000
@@ -30,6 +30,24 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 shutil.copy("train_snake.py", OUTPUT_DIR)
 shutil.copy("run_snake.py", OUTPUT_DIR)
 shutil.copy("snake_env.py", OUTPUT_DIR)
+
+use_wandb = input("Use Weights & Biases? [y/n]: ").lower() == "y"
+if use_wandb:
+    import wandb
+    wandb.init(
+        project="rl",
+        name=f"snake_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
+        config={
+            "model_type": "transformer",
+            "lr": LR,
+            "rollout_steps": ROLLOUT_STEPS,
+            "eps": EPS,
+            "board_size": BOARD_SIZE,
+        }
+    )
+    wandb.run.log_code("train_snake.py")
+    wandb.run.log_code("snake_env.py")
+    wandb.run.log_code("run_snake.py")
 
 # --- MODELS ---
 
@@ -229,13 +247,14 @@ def train():
             torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "best.pth"))
 
         # --- EVAL / RENDER ---
-        if RENDER and iteration % 10 == 0:
+        if iteration % 10 == 0:
             model.eval()
             eval_state, _ = eval_env.reset()
             eval_total_reward = 0
             eval_steps = 0
             while True:
-                eval_env.render()
+                if RENDER:
+                    eval_env.render()
                 with torch.no_grad():
                     obs = torch.tensor(eval_state, device=DEVICE, dtype=torch.float32).unsqueeze(0)
                     logits, _ = model(obs)
@@ -245,10 +264,25 @@ def train():
                 eval_total_reward += r
                 eval_steps += 1
                 if term or trunc:
-                    eval_env.close()
+                    if RENDER:
+                        eval_env.close()
                     break
             print(f"   ---> Eval Episode | Steps: {eval_steps} | Reward: {eval_total_reward:.2f} | Length: {eval_info.get('length', 'N/A')} <---")
+            wandb.log({
+                "metrics/eval_length": eval_info.get("length", 0.0),
+                "metrics/eval_reward": eval_total_reward,
+            }, step=iteration)
             model.train()
+        if use_wandb:
+            wandb.log({
+                "metrics/avg_length": avg_l,
+                "metrics/avg_reward": np.mean(rewards),
+                "losses/policy_loss": np.mean(pg_losses),
+                "losses/value_loss": np.mean(v_losses),
+                "losses/entropy": np.mean(ent_losses),
+                "charts/learning_rate": current_lr,
+                "charts/entropy_coef": current_ent_coef,
+            }, step=iteration)
 
 if __name__ == "__main__":
     train()
