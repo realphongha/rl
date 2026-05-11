@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributions as dist
+import wandb
 import numpy as np
 import gymnasium as gym
 import snake_env
@@ -13,12 +14,12 @@ from datetime import datetime
 # --- CONFIGURATION ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BOARD_SIZE = 8
-LR = 3e-4
+LR = 1e-4
 GAMMA, GAE_LAMBDA = 0.99, 0.95
-CLIP_EPS, ENTROPY_COEF = 0.2, 0.02
+CLIP_EPS, ENTROPY_COEF = 0.2, 0.005
 ROLLOUT_STEPS = 2048
 BATCH_SIZE = 128
-UPDATE_EPOCHS = 4
+UPDATE_EPOCHS = 8
 RENDER = False
 NUM_ENVS = 32
 
@@ -33,7 +34,6 @@ shutil.copy("snake_env.py", OUTPUT_DIR)
 
 use_wandb = input("Use Weights & Biases? [y/n]: ").lower() == "y"
 if use_wandb:
-    import wandb
     wandb.init(
         project="rl",
         name=f"snake_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
@@ -81,113 +81,332 @@ class SnakeCNN(nn.Module):
         f = self.flatten(self.convs(x))
         return self.actor(f), self.critic(f)
 
+def build_2d_sincos_pos_embed(h, w, dim, device):
+    assert dim % 4 == 0
+
+    y, x = torch.meshgrid(
+        torch.arange(h, device=device),
+        torch.arange(w, device=device),
+        indexing='ij'
+    )
+
+    omega = torch.arange(dim // 4, device=device)
+    omega = 1.0 / (10000 ** (omega / (dim // 4)))
+
+    y = y.flatten()[:, None] * omega[None, :]
+    x = x.flatten()[:, None] * omega[None, :]
+
+    pos = torch.cat([
+        torch.sin(x),
+        torch.cos(x),
+        torch.sin(y),
+        torch.cos(y),
+    ], dim=1)
+
+    return pos.unsqueeze(0)
+
 class SnakeTransformer(nn.Module):
-    def __init__(self, size=8, d_model=128, nhead=4, num_layers=3):
+    def __init__(
+        self,
+        size=8, d_model=128, nhead=4, num_layers=2,
+    ):
         super().__init__()
+
         self.size = size
         self.d_model = d_model
 
-        # Each cell (pixel) on the 8x8 grid is a "token"
-        # Input features: 3 (Empty, Snake, Food/Head)
-        self.patch_embed = nn.Linear(3, d_model)
+        # Per-cell embedding
+        self.patch_embed = nn.Sequential(
+            nn.Linear(3, d_model),
+            nn.GELU(),
+        )
 
-        # Learned Positional Embeddings - CRITICAL without CNNs
-        self.pos_emb = nn.Parameter(torch.randn(1, size * size, d_model))
+        # CLS token for global aggregation
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        # The Transformer Core
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=d_model * 4,
-            dropout=0.0, # Keep it deterministic for RL stability
+            dropout=0.0,
+            activation="gelu",
             batch_first=True,
-            norm_first=True
+            norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Heads
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        self.final_norm = nn.LayerNorm(d_model)
+
         self.actor = nn.Linear(d_model, 4)
         self.critic = nn.Linear(d_model, 1)
 
         self._init()
 
     def _init(self):
-        # Orthogonal init is non-negotiable for Transformers in RL
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.orthogonal_(p, gain=1.0)
 
+        nn.init.normal_(self.cls_token, std=0.02)
+
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.constant_(self.actor.bias, 0)
+
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         nn.init.constant_(self.critic.bias, 0)
 
     def forward(self, x):
-        # x shape: (B, 3, 8, 8)
+        # x: (B, 3, H, W)
+
         b, c, h, w = x.shape
 
-        # 1. Flatten the board into a sequence of tokens
-        # (B, 3, 64) -> (B, 64, 3)
+        # Flatten board -> tokens
         tokens = x.view(b, c, h * w).permute(0, 2, 1)
 
-        # 2. Project to d_model and add spatial information
-        # Without pos_emb, the model literally wouldn't know the grid's shape
-        x = self.patch_embed(tokens) + self.pos_emb
+        # Patch embedding
+        x = self.patch_embed(tokens)
 
-        # 3. Process with Global Self-Attention
-        # Every cell looks at every other cell simultaneously
-        out = self.transformer(x)
+        # Add 2D sinusoidal positions
+        pos = build_2d_sincos_pos_embed(
+            h, w, self.d_model, x.device
+        )
 
-        # 4. Global Average Pooling (Latent Representation)
-        global_feat = out.mean(dim=1)
+        x = x + pos
 
-        return self.actor(global_feat), self.critic(global_feat)
+        # CLS token
+        cls = self.cls_token.expand(b, -1, -1)
+
+        x = torch.cat([cls, x], dim=1)
+
+        # Transformer
+        x = self.transformer(x)
+
+        # Take CLS output
+        global_feat = x[:, 0]
+
+        global_feat = self.final_norm(global_feat)
+
+        return (
+            self.actor(global_feat),
+            self.critic(global_feat)
+        )
 
 class SnakeHybridNet(nn.Module):
-    def __init__(self, size, d_model=128, nhead=4, num_layers=2):
+    def __init__(
+        self, size=8, d_model=128, nhead=4, num_layers=2
+    ):
         super().__init__()
+
+        self.size = size
+        self.d_model = d_model
+
         self.convs = get_convs()
-        self.proj = nn.Linear(64, d_model)
-        self.pos_emb = nn.Parameter(torch.randn(1, size * size, d_model))
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, norm_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Project CNN features into transformer space
+        self.proj = nn.Sequential(
+            nn.Linear(64, d_model),
+            nn.GELU(),
+        )
+
+        self.cls_token = nn.Parameter(
+            torch.zeros(1, 1, d_model)
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        self.final_norm = nn.LayerNorm(d_model)
+
         self.actor = nn.Linear(d_model, 4)
         self.critic = nn.Linear(d_model, 1)
+
         self._init()
 
     def _init(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                # Orthogonal init with LeakyReLU gain
-                gain = nn.init.calculate_gain('leaky_relu')
-                nn.init.orthogonal_(m.weight, gain=gain)
+                nn.init.orthogonal_(
+                    m.weight,
+                    gain=nn.init.calculate_gain("relu")
+                )
+
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
             elif isinstance(m, nn.Linear):
-                # Standard linear layers in the Transformer/Projection
                 nn.init.orthogonal_(m.weight, gain=1.0)
+
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-        # 1. The "Quiet" Actor: Near-uniform exploration at start
+        nn.init.normal_(self.cls_token, std=0.02)
+
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.constant_(self.actor.bias, 0)
 
-        # 2. The "Standard" Critic: Clear value signal
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         nn.init.constant_(self.critic.bias, 0)
 
-        # 3. Subtle Positional Embeddings: Don't drown out the features!
-        nn.init.normal_(self.pos_emb, std=0.02)
-
     def forward(self, x):
+        # CNN feature extraction
         f = self.convs(x)
+
         b, c, h, w = f.shape
-        tokens = f.view(b, c, h*w).permute(0, 2, 1)
-        tokens = self.proj(tokens) + self.pos_emb
-        out = self.transformer(tokens)
-        global_feat = out.mean(dim=1)
-        return self.actor(global_feat), self.critic(global_feat)
+
+        # Spatial tokens
+        tokens = f.view(b, c, h * w).permute(0, 2, 1)
+
+        # Project to transformer dim
+        x = self.proj(tokens)
+
+        # 2D positions
+        pos = build_2d_sincos_pos_embed(
+            h, w, self.d_model, x.device
+        )
+
+        x = x + pos
+
+        # CLS token
+        cls = self.cls_token.expand(b, -1, -1)
+
+        x = torch.cat([cls, x], dim=1)
+
+        # Global reasoning
+        x = self.transformer(x)
+
+        # CLS pooling
+        global_feat = x[:, 0]
+
+        global_feat = self.final_norm(global_feat)
+
+        return (
+            self.actor(global_feat),
+            self.critic(global_feat)
+        )
+
+# class SnakeTransformer(nn.Module):
+#     def __init__(self, size=8, d_model=64, nhead=2, num_layers=1):
+#         super().__init__()
+#         self.size = size
+#         self.d_model = d_model
+#
+#         # Each cell (pixel) on the 8x8 grid is a "token"
+#         # Input features: 3 (Empty, Snake, Food/Head)
+#         self.patch_embed = nn.Linear(3, d_model)
+#
+#         # Learned Positional Embeddings - CRITICAL without CNNs
+#         self.pos_emb = nn.Parameter(torch.randn(1, size * size, d_model))
+#
+#         # The Transformer Core
+#         encoder_layer = nn.TransformerEncoderLayer(
+#             d_model=d_model,
+#             nhead=nhead,
+#             dim_feedforward=d_model * 4,
+#             dropout=0.0, # Keep it deterministic for RL stability
+#             batch_first=True,
+#             norm_first=True
+#         )
+#         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+#
+#         # Heads
+#         self.actor = nn.Linear(d_model, 4)
+#         self.critic = nn.Linear(d_model, 1)
+#
+#         self._init()
+#
+#     def _init(self):
+#         # Orthogonal init is non-negotiable for Transformers in RL
+#         for p in self.parameters():
+#             if p.dim() > 1:
+#                 nn.init.orthogonal_(p, gain=1.0)
+#
+#         nn.init.orthogonal_(self.actor.weight, gain=0.01)
+#         nn.init.orthogonal_(self.critic.weight, gain=1.0)
+#         nn.init.constant_(self.critic.bias, 0)
+#
+#     def forward(self, x):
+#         # x shape: (B, 3, 8, 8)
+#         b, c, h, w = x.shape
+#
+#         # 1. Flatten the board into a sequence of tokens
+#         # (B, 3, 64) -> (B, 64, 3)
+#         tokens = x.view(b, c, h * w).permute(0, 2, 1)
+#
+#         # 2. Project to d_model and add spatial information
+#         # Without pos_emb, the model literally wouldn't know the grid's shape
+#         x = self.patch_embed(tokens) + self.pos_emb
+#
+#         # 3. Process with Global Self-Attention
+#         # Every cell looks at every other cell simultaneously
+#         out = self.transformer(x)
+#
+#         # 4. Global Average Pooling (Latent Representation)
+#         global_feat = out.mean(dim=1)
+#
+#         return self.actor(global_feat), self.critic(global_feat)
+#
+# class SnakeHybridNet(nn.Module):
+#     def __init__(self, size, d_model=64, nhead=2, num_layers=1):
+#         super().__init__()
+#         self.convs = get_convs()
+#         self.proj = nn.Linear(64, d_model)
+#         self.pos_emb = nn.Parameter(torch.randn(1, size * size, d_model))
+#         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, norm_first=True)
+#         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+#         self.actor = nn.Linear(d_model, 4)
+#         self.critic = nn.Linear(d_model, 1)
+#         self._init()
+#
+#     def _init(self):
+#         for m in self.modules():
+#             if isinstance(m, nn.Conv2d):
+#                 # Orthogonal init with LeakyReLU gain
+#                 gain = nn.init.calculate_gain('leaky_relu')
+#                 nn.init.orthogonal_(m.weight, gain=gain)
+#                 if m.bias is not None:
+#                     nn.init.constant_(m.bias, 0)
+#
+#             elif isinstance(m, nn.Linear):
+#                 # Standard linear layers in the Transformer/Projection
+#                 nn.init.orthogonal_(m.weight, gain=1.0)
+#                 if m.bias is not None:
+#                     nn.init.constant_(m.bias, 0)
+#
+#         # 1. The "Quiet" Actor: Near-uniform exploration at start
+#         nn.init.orthogonal_(self.actor.weight, gain=0.01)
+#         nn.init.constant_(self.actor.bias, 0)
+#
+#         # 2. The "Standard" Critic: Clear value signal
+#         nn.init.orthogonal_(self.critic.weight, gain=1.0)
+#         nn.init.constant_(self.critic.bias, 0)
+#
+#         # 3. Subtle Positional Embeddings: Don't drown out the features!
+#         nn.init.normal_(self.pos_emb, std=0.02)
+#
+#     def forward(self, x):
+#         f = self.convs(x)
+#         b, c, h, w = f.shape
+#         tokens = f.view(b, c, h*w).permute(0, 2, 1)
+#         tokens = self.proj(tokens) + self.pos_emb
+#         out = self.transformer(tokens)
+#         global_feat = out.mean(dim=1)
+#         return self.actor(global_feat), self.critic(global_feat)
 
 # --- TRAINING ENGINE ---
 
@@ -199,7 +418,9 @@ def train():
 
     envs = gym.vector.AsyncVectorEnv([make_env() for _ in range(NUM_ENVS)])
     eval_env = gym.make("Snake-v0", size=BOARD_SIZE, render_mode="human" if RENDER else None)
-    model = SnakeCNN(BOARD_SIZE).to(DEVICE)
+    # model = SnakeCNN(BOARD_SIZE).to(DEVICE)
+    model = SnakeHybridNet(BOARD_SIZE).to(DEVICE)
+    # model = SnakeTransformer(BOARD_SIZE).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-5)
 
     best_len = 0

@@ -112,7 +112,7 @@ class SnakeEnv(gym.Env):
         else:
             self._snake.pop()
             # Sparse reward: tiny living penalty to discourage looping
-            reward = -0.01
+            reward = -0.001
             new_dist = manhattan(new_head, self._food)
             dist_reward = 0.01 if (new_dist < old_dist) else -0.01
 
